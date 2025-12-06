@@ -1,411 +1,300 @@
 import threading
-import re
-import sys
-import tkinter  # needed for some type hints in customtkinter
+import queue
+import time
+import serial
+import serial.tools.list_ports
 import customtkinter as ctk
-
-try:
-    import serial
-    from serial.tools import list_ports
-except ImportError:
-    serial = None
-    list_ports = None
-
-# ---------------------- CONFIGURABLE CONSTANTS ---------------------- #
-
-BAUDRATE = 115200
-SERIAL_TIMEOUT = 1.0  # seconds
-SCAN_COMMAND = "SCAN"  # what we send to request a scan
-
-# Matches AA:BB:CC:DD:EE:FF style MAC addresses
-MAC_REGEX = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
+from typing import Optional
 
 
-# --------------------------- SERIAL MANAGER ------------------------- #
+# ------------- Node Card (one per MAC) ------------- #
 
-class SerialManager:
+class NodeCard(ctk.CTkFrame):
     """
-    Handles serial port connection and background reading.
-
-    - call open_port(port) to connect
-    - call close_port() to disconnect
-    - call write_line(text) to send a line (adds newline automatically)
-    - on_line_callback(line: str) is called whenever a new line is read
-      (from a background thread)
+    A UI card representing a single microcontroller/node on the mesh.
     """
 
-    def __init__(self, on_line_callback=None, baudrate=BAUDRATE, timeout=SERIAL_TIMEOUT):
-        self.on_line_callback = on_line_callback
-        self.baudrate = baudrate
-        self.timeout = timeout
-
-        self._serial = None
-        self._reader_thread = None
-        self._stop_event = threading.Event()
-
-    @property
-    def is_open(self) -> bool:
-        return self._serial is not None and self._serial.is_open
-
-    @staticmethod
-    def list_serial_ports():
-        """Return a list of port device names, e.g. ['COM3', '/dev/ttyUSB0']"""
-        if list_ports is None:
-            return []
-        return [p.device for p in list_ports.comports()]
-
-    def open_port(self, port: str):
-        """Open the given serial port and start the reader thread."""
-        if serial is None:
-            raise RuntimeError("pyserial is not installed. Run 'pip install pyserial'.")
-
-        self.close_port()
-
-        self._serial = serial.Serial(
-            port=port,
-            baudrate=self.baudrate,
-            timeout=self.timeout
-        )
-
-        self._stop_event.clear()
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop, daemon=True
-        )
-        self._reader_thread.start()
-
-    def close_port(self):
-        """Close the serial port and stop the reader thread."""
-        self._stop_event.set()
-
-        if self._reader_thread is not None:
-            self._reader_thread.join(timeout=1.0)
-            self._reader_thread = None
-
-        if self._serial is not None:
-            if self._serial.is_open:
-                self._serial.close()
-            self._serial = None
-
-    def write_line(self, text: str):
-        """Send a line of text over serial (with newline)."""
-        if not self.is_open:
-            return
-        data = (text + "\n").encode("utf-8", errors="ignore")
-        self._serial.write(data)
-        self._serial.flush()
-
-    def _reader_loop(self):
-        """Background thread: reads lines and calls the callback."""
-        while not self._stop_event.is_set():
-            try:
-                if not self.is_open:
-                    break
-                line_bytes = self._serial.readline()
-                if not line_bytes:
-                    continue
-                line = line_bytes.decode("utf-8", errors="ignore").strip()
-                if line and self.on_line_callback:
-                    self.on_line_callback(line)
-            except Exception:
-                # In production you might log this:
-                # print("Error in serial reader:", e)
-                break
-
-
-# ---------------------------- DEVICE CARD --------------------------- #
-
-class DeviceCard(ctk.CTkFrame):
-    """
-    Represents a single microcontroller/node on the right side.
-    You can easily expand this with more labels, buttons, graphs, etc.
-    """
-
-    def __init__(self, parent, mac_address: str, *args, **kwargs):
-        super().__init__(parent, *args, **kwargs)
-
+    def __init__(self, master, mac_address: str, send_callback, *args, **kwargs):
+        super().__init__(master, *args, **kwargs)
         self.mac_address = mac_address
+        self.send_callback = send_callback  # function(mac: str, text: str)
 
-        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
 
-        self.label_title = ctk.CTkLabel(
-            self,
-            text=f"Device: {mac_address}",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        self.label_title.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.label_mac = ctk.CTkLabel(self, text=f"MAC: {self.mac_address}")
+        self.label_mac.grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 5), sticky="w")
 
-        # Placeholder for more info (RSSI, status, etc.)
-        self.label_status = ctk.CTkLabel(
-            self,
-            text="Status: discovered",
-            font=ctk.CTkFont(size=12)
-        )
-        self.label_status.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
+        self.entry_text = ctk.CTkEntry(self, placeholder_text="Enter text to send...")
+        self.entry_text.grid(row=1, column=0, padx=10, pady=5, sticky="we")
 
-        # Example button; you can wire this up to send commands to this node
-        self.button_action = ctk.CTkButton(
-            self,
-            text="Placeholder Action",
-            command=self.on_action_click
-        )
-        self.button_action.grid(row=0, column=1, rowspan=2,
-                                sticky="e", padx=10, pady=8)
+        self.button_send = ctk.CTkButton(self, text="Send Text", command=self.on_send_clicked)
+        self.button_send.grid(row=1, column=1, padx=10, pady=5)
 
-    def on_action_click(self):
-        # For now, just print. You can hook up something real here.
-        print(f"[DeviceCard] Action clicked for {self.mac_address}")
+    def on_send_clicked(self):
+        text = self.entry_text.get().strip()
+        if text:
+            self.send_callback(self.mac_address, text)
 
 
-# ------------------------------- APP -------------------------------- #
+# ------------- Serial Worker Thread ------------- #
+
+class SerialWorker(threading.Thread):
+    """
+    Background thread that reads *lines* from a serial port and pushes them into a queue.
+    Uses readline() with a timeout so each line is processed cleanly.
+    """
+
+    def __init__(self, ser: serial.Serial, line_queue: queue.Queue, stop_event: threading.Event):
+        super().__init__(daemon=True)
+        self.ser = ser
+        self.line_queue = line_queue
+        self.stop_event = stop_event
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                line_bytes = self.ser.readline()
+                if line_bytes:
+                    try:
+                        text = line_bytes.decode("utf-8", errors="ignore").strip()
+                    except Exception:
+                        text = ""
+                    if text:
+                        self.line_queue.put(text)
+                else:
+                    time.sleep(0.01)
+
+            except serial.SerialException:
+                break
+            except Exception:
+                time.sleep(0.05)
+
+
+# ------------- Main Application ------------- #
 
 class MeshApp(ctk.CTk):
-    """
-    Main application window.
-
-    Layout:
-    - Left sidebar (serial controls)
-    - Right area with scrollable device cards
-    """
 
     def __init__(self):
         super().__init__()
 
-        # --- Basic window setup ---
-        ctk.set_appearance_mode("Dark")      # or "Light", "System"
-        ctk.set_default_color_theme("blue")  # can be "green", "dark-blue", etc.
+        self.title("Mesh Network Serial UI")
+        self.geometry("900x600")
 
-        self.title("Mesh Network Device Scanner")
-        self.geometry("1000x600")
-        self.minsize(800, 500)
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
 
-        # serial manager
-        self.serial_manager = SerialManager(
-            on_line_callback=self._on_serial_line_from_thread
-        )
+        # Serial-related state
+        self.serial_port = None              # type: Optional[serial.Serial]
+        self.serial_thread = None            # type: Optional[SerialWorker]
+        self.serial_stop_event = threading.Event()
+        self.serial_line_queue = queue.Queue()
 
-        # used by OptionMenu
-        self.selected_port = ctk.StringVar(value="")
+        # Node cards by MAC string
+        self.node_cards = {}  # mac -> NodeCard
 
-        # store device cards: {mac: DeviceCard}
-        self.device_cards = {}
-
-        # configure main grid
-        self.grid_columnconfigure(0, weight=0)  # sidebar
-        self.grid_columnconfigure(1, weight=1)  # main content
+        # Layout
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self._build_sidebar()
-        self._build_main_area()
+        self._create_sidebar()
+        self._create_main_area()
 
-        # populate ports on start
-        self.refresh_ports()
+        # Start polling queue
+        self.after(50, self._poll_serial_queue)
 
-    # ------------------------ UI BUILDERS ------------------------ #
+    # ----- UI creation -----
 
-    def _build_sidebar(self):
-        self.sidebar = ctk.CTkFrame(self, width=240)
-        self.sidebar.grid(row=0, column=0, sticky="nsw", padx=10, pady=10)
-        self.sidebar.grid_propagate(False)
+    def _create_sidebar(self):
+        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nswe")
+        self.sidebar.grid_rowconfigure(10, weight=1)
 
-        self.sidebar.grid_rowconfigure(99, weight=1)
-
-        # Title
         label_title = ctk.CTkLabel(
-            self.sidebar, text="Serial Connection",
+            self.sidebar,
+            text="Mesh Controller",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        label_title.grid(row=0, column=0, padx=10, pady=(10, 10), sticky="w")
+        label_title.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
 
-        # Port selector section
-        frame_ports = ctk.CTkFrame(self.sidebar)
-        frame_ports.grid(row=1, column=0, padx=10, pady=(0, 15), sticky="ew")
-        frame_ports.grid_columnconfigure(0, weight=1)
+        label_port = ctk.CTkLabel(self.sidebar, text="Serial Port:")
+        label_port.grid(row=1, column=0, padx=10, pady=(10, 0), sticky="w")
 
-        label_port = ctk.CTkLabel(frame_ports, text="Port:", anchor="w")
-        label_port.grid(row=0, column=0, sticky="w", pady=(10, 5), padx=10)
+        self.port_var = ctk.StringVar()
+        self.combo_ports = ctk.CTkComboBox(self.sidebar, variable=self.port_var, values=[])
+        self.combo_ports.grid(row=2, column=0, padx=10, pady=5, sticky="we")
 
-        self.optionmenu_ports = ctk.CTkOptionMenu(
-            frame_ports,
-            values=[],
-            variable=self.selected_port
+        self.button_refresh_ports = ctk.CTkButton(
+            self.sidebar, text="Refresh Ports", command=self.refresh_ports
         )
-        self.optionmenu_ports.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
-
-        button_refresh = ctk.CTkButton(
-            frame_ports,
-            text="Refresh Ports",
-            command=self.refresh_ports
-        )
-        button_refresh.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-
-        # Connect / Disconnect section
-        frame_connect = ctk.CTkFrame(self.sidebar)
-        frame_connect.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
-        frame_connect.grid_columnconfigure(0, weight=1)
+        self.button_refresh_ports.grid(row=3, column=0, padx=10, pady=5, sticky="we")
 
         self.button_connect = ctk.CTkButton(
-            frame_connect,
-            text="Connect & Scan",
-            command=self.on_connect_clicked
+            self.sidebar, text="Connect", command=self.on_connect_clicked
         )
-        self.button_connect.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
+        self.button_connect.grid(row=4, column=0, padx=10, pady=10, sticky="we")
 
-        self.label_status = ctk.CTkLabel(
-            frame_connect,
-            text="Status: Disconnected",
-            wraplength=200,
-            anchor="w",
-            justify="left"
+        self.button_scan = ctk.CTkButton(
+            self.sidebar, text="Scan All", command=self.on_scan_all_clicked, state="disabled"
         )
-        self.label_status.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+        self.button_scan.grid(row=5, column=0, padx=10, pady=5, sticky="we")
 
-    def _build_main_area(self):
-        self.main_area = ctk.CTkFrame(self)
-        self.main_area.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
+        self.label_status = ctk.CTkLabel(self.sidebar, text="Disconnected", text_color="red")
+        self.label_status.grid(row=6, column=0, padx=10, pady=10, sticky="w")
 
-        self.main_area.grid_rowconfigure(1, weight=1)
-        self.main_area.grid_columnconfigure(0, weight=1)
+        self.refresh_ports()
 
-        label_devices = ctk.CTkLabel(
-            self.main_area,
-            text="Discovered Devices",
-            font=ctk.CTkFont(size=16, weight="bold")
-        )
-        label_devices.grid(row=0, column=0, sticky="w", pady=(0, 10), padx=5)
+    def _create_main_area(self):
+        self.main_frame = ctk.CTkFrame(self)
+        self.main_frame.grid(row=0, column=1, sticky="nswe")
+        self.main_frame.grid_rowconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
 
-        self.devices_frame = ctk.CTkScrollableFrame(
-            self.main_area,
-            label_text="Mesh Nodes",
-        )
-        self.devices_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        self.card_container = ctk.CTkScrollableFrame(self.main_frame)
+        self.card_container.grid(row=0, column=0, padx=10, pady=10, sticky="nswe")
 
-        self.devices_frame.grid_columnconfigure(0, weight=1)
-
-    # ---------------------- SERIAL UI HANDLERS ---------------------- #
+    # ----- Serial Port Management -----
 
     def refresh_ports(self):
-        ports = self.serial_manager.list_serial_ports()
-        if not ports:
-            ports = ["<no ports>"]
-            self.selected_port.set(ports[0])
+        ports = serial.tools.list_ports.comports()
+        values = [p.device for p in ports]
+        self.combo_ports.configure(values=values)
+        if values:
+            self.port_var.set(values[0])
         else:
-            # If current selection not in new list, reset.
-            if self.selected_port.get() not in ports:
-                self.selected_port.set(ports[0])
-
-        self.optionmenu_ports.configure(values=ports)
+            self.port_var.set("")
 
     def on_connect_clicked(self):
-        # toggle behavior
-        if self.serial_manager.is_open:
-            # disconnect
-            self.serial_manager.close_port()
-            self.button_connect.configure(text="Connect & Scan")
-            self._update_status("Status: Disconnected")
-        else:
-            port = self.selected_port.get().strip()
-            if not port or port == "<no ports>":
-                self._update_status("Status: No valid serial port selected.")
-                return
+        if self.serial_port and self.serial_port.is_open:
+            return
 
+        port_name = self.port_var.get().strip()
+        if not port_name:
+            self._set_status("No port selected", error=True)
+            return
+
+        # Cleanup older connection
+        if self.serial_port:
             try:
-                self.serial_manager.open_port(port)
-            except Exception as e:
-                self._update_status(f"Status: Failed to open {port}: {e}")
-                return
+                self.serial_stop_event.set()
+                time.sleep(0.1)
+                if self.serial_port.is_open:
+                    self.serial_port.close()
+            except Exception:
+                pass
+        self.serial_port = None
+        self.serial_stop_event = threading.Event()
 
-            self.button_connect.configure(text="Disconnect")
-            self._update_status(f"Status: Connected to {port}. Sending scan request...")
-
-            # When we first connect, immediately send a scan
-            self.send_scan_request()
-
-    def send_scan_request(self):
-        if not self.serial_manager.is_open:
-            self._update_status("Status: Not connected.")
+        try:
+            self.serial_port = serial.Serial(
+                port=port_name,
+                baudrate=115200,
+                timeout=0.1,
+                write_timeout=0.5
+            )
+        except serial.SerialException as e:
+            self._set_status(f"Failed to open {port_name}", error=True)
+            print("Serial Exception:", e)
             return
 
-        # Optionally clear devices each scan:
-        # self.clear_devices()
-        self.serial_manager.write_line(SCAN_COMMAND)
+        # Flush buffers
+        try:
+            self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
+        except Exception:
+            pass
 
-    def _update_status(self, text: str):
-        self.label_status.configure(text=text)
-        print(text)
+        # Launch worker thread
+        self.serial_thread = SerialWorker(self.serial_port, self.serial_line_queue, self.serial_stop_event)
+        self.serial_thread.start()
 
-    # --------------------- SERIAL LINE PROCESSING -------------------- #
+        self._set_status(f"Connected to {port_name}", error=False)
+        self.button_scan.configure(state="normal")
+        self.button_connect.configure(state="disabled")
+        self.combo_ports.configure(state="disabled")
+        self.button_refresh_ports.configure(state="disabled")
 
-    def _on_serial_line_from_thread(self, line: str):
-        """
-        Called by SerialManager's background thread.
+        # Auto-scan
+        self.send_line("--scan-all")
 
-        We must NOT touch tkinter widgets from that thread,
-        so we schedule a call onto the main thread using `after`.
-        """
-        self.after(0, self.process_serial_line, line)
+    def _set_status(self, text, error=False):
+        color = "red" if error else "green"
+        self.label_status.configure(text=text, text_color=color)
 
-    def process_serial_line(self, line: str):
-        """
-        Main-thread-safe processing of incoming serial data.
+    def on_scan_all_clicked(self):
+        self.send_line("--scan-all")
 
-        This is where we extract MAC addresses and create cards.
-        """
+    def send_line(self, line: str):
+        if not self.serial_port or not self.serial_port.is_open:
+            self._set_status("Not connected", error=True)
+            return
+        try:
+            full = (line + "\n").encode("utf-8")
+            self.serial_port.write(full)
+            self.serial_port.flush()
+            print("[SERIAL OUT]", line)
+        except Exception as e:
+            print("Serial write error:", e)
+            self._set_status("Serial write error", error=True)
 
-        print(f"[Serial] {line}")
+    # ----- Serial Listener -----
 
-        matches = MAC_REGEX.findall(line)
-        if not matches:
+    def _poll_serial_queue(self):
+        try:
+            while True:
+                line = self.serial_line_queue.get_nowait()
+                self._handle_serial_line(line)
+        except queue.Empty:
+            pass
+
+        self.after(50, self._poll_serial_queue)
+
+    def _handle_serial_line(self, line: str):
+        line = line.strip()
+        if not line:
             return
 
-        for mac in matches:
-            normalized = mac.upper()
-            self.add_or_get_device_card(normalized)
+        print("[SERIAL IN]", line)
 
-    # ----------------------- DEVICE CARD MGMT ------------------------ #
+        if line.startswith("--scan-response"):
+            parts = line.split()
+            if len(parts) >= 2:
+                mac = parts[1]
+                self.add_node_card(mac)
 
-    def add_or_get_device_card(self, mac_address: str) -> DeviceCard:
-        """
-        Get an existing card for `mac_address`, or create a new one.
+    # ----- Card Management -----
 
-        This makes it easy for future code to retrieve and update
-        a device card (e.g., to update status or show sensor values).
-        """
-        if mac_address in self.device_cards:
-            return self.device_cards[mac_address]
+    def add_node_card(self, mac: str):
+        if mac in self.node_cards:
+            return
 
-        card = DeviceCard(
-            self.devices_frame,
-            mac_address=mac_address,
-            corner_radius=10
+        card = NodeCard(
+            master=self.card_container,
+            mac_address=mac,
+            send_callback=self.on_node_send
         )
+        card.pack(fill="x", padx=5, pady=5)
+        self.node_cards[mac] = card
 
-        # Use pack for simple vertical stacking.
-        card.pack(fill="x", padx=10, pady=5)
+    def on_node_send(self, mac: str, text: str):
+        cmd = f"--send-data {mac} {text}"
+        self.send_line(cmd)
 
-        self.device_cards[mac_address] = card
-        return card
-
-    def clear_devices(self):
-        """Remove all device cards."""
-        for card in self.device_cards.values():
-            card.destroy()
-        self.device_cards.clear()
-
-    # ------------------------------ MISC ------------------------------ #
+    # ----- Cleanup -----
 
     def on_closing(self):
-        """Cleanup on window close."""
-        self.serial_manager.close_port()
+        if self.serial_port:
+            try:
+                self.serial_stop_event.set()
+                time.sleep(0.1)
+                if self.serial_port.is_open:
+                    self.serial_port.close()
+            except Exception:
+                pass
         self.destroy()
 
 
-# ----------------------------- MAIN --------------------------------- #
-
-def main():
+if __name__ == "__main__":
     app = MeshApp()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()
-
-
-if __name__ == "__main__":
-    main()

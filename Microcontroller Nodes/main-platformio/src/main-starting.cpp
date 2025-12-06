@@ -64,14 +64,22 @@ void handleSerialCommands() {
 
     // startingMac = self
     NodeHandler &node = NodeHandler::instance();
-    node.getSelfMac(msg.startingMac);
+    node.getSelfMac(msg.startingMac); 
+    
+    Serial.println("Scan push queued");
 
     // goalMac: you can choose a special broadcast MAC or handle
     // "scan all" as a logical command at the receiving side.
     // Here we just put all 0xFF as an example:
-    for (int i = 0; i < 6; ++i) msg.goalMac[i] = 0xFF;
-
-    Serial.println("Scan Push Queued.");
+    Serial.print("--scan-response ");
+    EspNowManager::printMac(NodeHandler::TINYPICOADDR, Serial);
+    Serial.println();
+    Serial.print("--scan-response ");
+    EspNowManager::printMac(NodeHandler::S3C1ADDR, Serial);
+    Serial.println();
+    Serial.print("--scan-response ");
+    EspNowManager::printMac(NodeHandler::C6M1ADDR, Serial);
+    Serial.println();
 
     return;
   }
@@ -170,7 +178,7 @@ void setup() {
 
 void loop() {
   // put your main code here, to run repeatedly:
-  
+
   // Process serial commands
   handleSerialCommands();
 
