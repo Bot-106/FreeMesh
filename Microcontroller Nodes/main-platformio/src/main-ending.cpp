@@ -3,10 +3,20 @@
 
 NodeHandler::message_t outgoingMessage{};
 
+void printActualText(const char *text) {
+    if (!text) {
+        Serial.println("(null)");
+        return;
+    }
+
+    Serial.print("actualText: \"");
+    Serial.print(text);
+    Serial.println("\"");
+}
+
 bool ledState = false;
 void onPacketReachedGoal(const uint8_t *fromMac, const uint8_t *data, int len) {
-  digitalWrite(12, ledState ? HIGH : LOW);
-  ledState = !ledState;
+  printActualText(((const NodeHandler::message_t*)data)->payload);
 }
 
 void setup() {
@@ -38,5 +48,5 @@ void setup() {
 
 void loop() {
   // put your main code here, to run repeatedly:
-  
+  NodeHandler::instance().tick();
 }

@@ -18,10 +18,13 @@ void setup() {
   } else {
     Serial.println("Neighbor peers added successfully.");
   }
+  uint8_t selfMac[6];
+  NodeHandler::instance().getSelfMac(selfMac);
+  EspNowManager::instance().printMac(selfMac, Serial);
   delay(1000);
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-  
+  NodeHandler::instance().tick();
 }

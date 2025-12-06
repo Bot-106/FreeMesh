@@ -4,10 +4,12 @@ NodeHandler* NodeHandler::_self = nullptr;
 
 const uint8_t NodeHandler::TINYPICOADDR[6] = {0xD4, 0xD4, 0xDA, 0x83, 0x9F, 0xEC};
 const uint8_t NodeHandler::C6M1ADDR[6]    = {0x54, 0x32, 0x04, 0x08, 0x49, 0x40};
+const uint8_t NodeHandler::S3C1ADDR[6]    = {0x34, 0x85, 0x18, 0x6C, 0xF6, 0x9C};
 
 const uint8_t* NodeHandler::ALL_MACS[] = {
     NodeHandler::TINYPICOADDR,
-    NodeHandler::C6M1ADDR
+    NodeHandler::C6M1ADDR,
+    NodeHandler::S3C1ADDR
 };
 const uint8_t NodeHandler::NUM_MACS = sizeof(NodeHandler::ALL_MACS) / sizeof(NodeHandler::ALL_MACS[0]);
 
@@ -125,17 +127,127 @@ void NodeHandler::onEspNowReceive(const uint8_t *fromMac,
   bool isSelfGoalMac = macEqual(msg.goalMac, NodeHandler::instance()._selfMac);
   memcpy(&msg, data, sizeof(NodeHandler::message_t));
 
-  Serial.print("RECV | From: ");
-  EspNowManager::printMac(fromMac, Serial);
-  Serial.print(" | Goal: ");
-  EspNowManager::printMac(msg.goalMac, Serial);
-  Serial.print(" | Self: ");
-  EspNowManager::printMac(NodeHandler::instance()._selfMac, Serial);
-  Serial.print(" | Msg ID: ");
-  Serial.print(msg.msgId); 
-  Serial.print(" | At Destination: ");
-  Serial.print(isSelfGoalMac);
-  Serial.println();
+  if (NodeHandler::instance().hasSeenMessageId(msg.msgId)) {
+      // Duplicate message, ignore
+      Serial.print("DUPLICATE MSG ID ");
+      Serial.println(msg.msgId);
+      return;
+  } else {
+        NodeHandler::instance().rememberMessageId(msg.msgId);
+  }
 
-  if (isSelfGoalMac) NodeHandler::instance().onPacketReachedGoal(fromMac, data, len);
+  if (msg.msgType == SCAN_PUSH) {
+    if (macEqual(msg.goalMac, NodeHandler::instance()._selfMac)) {
+        // This scan push is for us; respond with SCAN_RESPONSE
+        NodeHandler::message_t responseMsg;
+        memcpy(responseMsg.startingMac, NodeHandler::instance()._selfMac, 6);
+        memcpy(responseMsg.goalMac, NodeHandler::TINYPICOADDR, 6);
+        responseMsg.msgId = esp_random();
+        responseMsg.msgType = SCAN_RESPONSE;
+        memset(responseMsg.payload, 0, sizeof(responseMsg.payload));
+
+        NodeHandler::instance().addMessageToSendQueue(responseMsg);
+    } else {
+        NodeHandler::message_t responseMsg;
+        memcpy(responseMsg.startingMac, NodeHandler::instance()._selfMac, 6);
+        memcpy(responseMsg.goalMac, msg.goalMac, 6);
+        responseMsg.msgId = msg.msgId;
+        responseMsg.msgType = SCAN_PUSH;
+        memset(responseMsg.payload, 0, sizeof(responseMsg.payload));
+
+        NodeHandler::instance().addMessageToSendQueue(responseMsg);
+    }
+  } else if (msg.msgType == SCAN_RESPONSE) {
+    if (macEqual(msg.goalMac, NodeHandler::TINYPICOADDR) && macEqual(NodeHandler::TINYPICOADDR, NodeHandler::instance()._selfMac)) {
+        // This scan response is for us
+        Serial.print("--scan_response--");
+        EspNowManager::instance().printMac(msg.startingMac, Serial);
+        Serial.println();
+    } else if (macEqual(msg.goalMac, NodeHandler::instance()._selfMac)) {
+        return;
+    } else {
+        // Forward the SCAN_RESPONSE to its goal
+        NodeHandler::message_t forwardMsg;
+        memcpy(forwardMsg.startingMac, msg.startingMac, 6);
+        memcpy(forwardMsg.goalMac, msg.goalMac, 6);
+        forwardMsg.msgId = msg.msgId;
+        forwardMsg.msgType = SCAN_RESPONSE;
+        memset(forwardMsg.payload, 0, sizeof(forwardMsg.payload));
+
+        NodeHandler::instance().addMessageToSendQueue(forwardMsg);
+    }
+  } else {
+    // Regular message
+    if (isSelfGoalMac) {
+        // Message reached its goal
+        if (NodeHandler::instance().onPacketReachedGoal) {
+            NodeHandler::instance().onPacketReachedGoal(fromMac, data, len);
+        }
+    } else {
+        // Forward the message to its goal
+        NodeHandler::message_t forwardMsg;
+        memcpy(forwardMsg.startingMac, msg.startingMac, 6);
+        memcpy(forwardMsg.goalMac, msg.goalMac, 6);
+        forwardMsg.msgId = msg.msgId;
+        forwardMsg.msgType = REGULAR_MESSAGE;
+        memcpy(forwardMsg.payload, msg.payload, sizeof(msg.payload));
+
+        NodeHandler::instance().addMessageToSendQueue(forwardMsg);
+    }
+  }
+}
+
+bool NodeHandler::addMessageToSendQueue(const message_t &msg) {
+    if (!_ready) return false;
+
+    // Queue full?
+    if (_outCount >= OUT_QUEUE_SIZE) {
+        // You could drop or overwrite oldest; here we just fail
+        return false;
+    }
+
+    // Copy message into queue at tail
+    _outQueue[_outTail] = msg;  // struct copy
+    _outTail = (_outTail + 1) % OUT_QUEUE_SIZE;
+    _outCount++;
+
+    return true;
+}
+
+void NodeHandler::tick() {
+    if (!_ready) return;
+    if (_outCount == 0) return;  // nothing to do
+
+    // Only send one per tick to avoid spamming
+    message_t &msg = _outQueue[_outHead];
+
+    bool ok = sendMessageToAll(msg);
+
+    // Whether it succeeds or fails, we pop it from the queue.
+    // If you want retries, you could only pop on success instead.
+    _outHead = (_outHead + 1) % OUT_QUEUE_SIZE;
+    _outCount--;
+}
+
+void NodeHandler::rememberMessageId(uint32_t msgId) {
+    // If we have space, put it at (head + count)
+    if (_pastCount < MAX_PAST_IDS) {
+        uint8_t idx = (_pastHead + _pastCount) % MAX_PAST_IDS;
+        _pastIds[idx] = msgId;
+        _pastCount++;
+    } else {
+        // Queue full: overwrite the oldest entry at _pastHead
+        _pastIds[_pastHead] = msgId;
+        _pastHead = (_pastHead + 1) % MAX_PAST_IDS;
+    }
+}
+
+bool NodeHandler::hasSeenMessageId(uint32_t msgId) const {
+    for (uint8_t i = 0; i < _pastCount; ++i) {
+        uint8_t idx = (_pastHead + i) % MAX_PAST_IDS;
+        if (_pastIds[idx] == msgId) {
+            return true;
+        }
+    }
+    return false;
 }
